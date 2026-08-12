@@ -26,6 +26,18 @@ Enter Gold Cup, finish round 1 with a win, verify non-zero match coins on the re
 
 This project expects an existing legitimate FIFA 14 PC installation and does not include the game itself.
 
+### New client build diagnostics
+
+Before adding a new client profile, run the read-only build diagnostic against the user's FIFA 14 `Game` folder:
+
+```powershell
+& ".\.venv\Scripts\python.exe" ".\tools\diagnose_fifa14_build.py" `
+    --game-root "D:\Jogos\FIFA 14\Game" `
+    --output ".\artifacts\fifa14-build-diagnostic.json"
+```
+
+Replace the example `--game-root` value with the user's `Game` path. The command writes `artifacts\fifa14-build-diagnostic.json`, does not modify the FIFA installation, and does not make the launcher accept the new build. The next port stage requires this JSON together with the user's runtime logs. Do not copy binary data into the JSON output or into the repository.
+
 ## Repository / development
 
 This repository is already prepared for GitHub with `.gitignore`, `.gitattributes`, issue templates, repository checks, and release-packaging scripts.
