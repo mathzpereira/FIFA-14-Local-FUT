@@ -14,6 +14,14 @@ from fifa14_build_layout import (
     discover_route_record,
     read_bh_records,
 )
+from fifa14_native_signatures import (
+    CARDS_TARGETS,
+    FIFA14_TARGETS,
+    raw_offset_to_rva,
+    read_pe_sections,
+    scan_native_targets,
+    scan_signature,
+)
 
 
 def align(value: int, boundary: int = 16) -> int:
@@ -59,6 +67,26 @@ def make_chunkzip_archive(record_index: int, path_hash: int, payload: bytes) -> 
     struct.pack_into(">I", bh, 8, records)
     struct.pack_into(">IIIII", bh, 16 + record_index * 20, record_offset, len(stored), 0, path_hash >> 32, path_hash & 0xFFFFFFFF)
     return big, bytes(bh)
+
+
+def make_pe_fixture(section_data: bytes = b"") -> bytes:
+    section_offset = 0x400
+    section_size = 0x200
+    pe_offset = 0x80
+    optional_size = 0xE0
+    section_table_offset = pe_offset + 4 + 20 + optional_size
+    image = bytearray(section_offset + section_size)
+    image[:2] = b"MZ"
+    struct.pack_into("<I", image, 0x3C, pe_offset)
+    image[pe_offset : pe_offset + 4] = b"PE\0\0"
+    struct.pack_into("<H", image, pe_offset + 6, 1)
+    struct.pack_into("<H", image, pe_offset + 20, optional_size)
+    struct.pack_into("<H", image, pe_offset + 24, 0x10B)
+    section = section_table_offset
+    image[section : section + 8] = b".text\0\0\0"
+    struct.pack_into("<IIII", image, section + 8, section_size, 0x1000, section_size, section_offset)
+    image[section_offset : section_offset + len(section_data)] = section_data
+    return bytes(image)
 
 
 class BuildLayoutTests(unittest.TestCase):
@@ -240,6 +268,75 @@ class BuildLayoutTests(unittest.TestCase):
             self.assertEqual(report["record16469"]["expectedPathHash"], "6471883D373E70C3")
             self.assertIsNone(report["record16469"]["record"])
             self.assertEqual(report["matches"][0]["record"]["index"], 4)
+
+    def test_pe_section_table_is_parsed_strictly(self):
+        sections = read_pe_sections(make_pe_fixture())
+        self.assertEqual(
+            sections,
+            [
+                {
+                    "name": ".text",
+                    "rawOffset": 0x400,
+                    "rawSize": 0x200,
+                    "virtualAddress": 0x1000,
+                    "virtualSize": 0x200,
+                }
+            ],
+        )
+        for malformed in (b"", b"MZ" + b"\0" * 62, make_pe_fixture()[:0x450]):
+            with self.assertRaises(ValueError):
+                read_pe_sections(malformed)
+
+    def test_signature_scan_distinguishes_unique_and_ambiguous(self):
+        data = b"prefix" + b"ABCDEF" + b"middle" + b"ABCDEF"
+        self.assertEqual(scan_signature(data, b"XYZ"), [])
+        self.assertEqual(scan_signature(data, b"ABCDEF"), [6, 18])
+
+    def test_raw_offset_maps_only_inside_a_pe_section(self):
+        sections = [{"name": ".text", "rawOffset": 0x400, "rawSize": 0x200, "virtualAddress": 0x1000, "virtualSize": 0x200}]
+        self.assertEqual(raw_offset_to_rva(0x450, sections), 0x1050)
+        with self.assertRaises(ValueError):
+            raw_offset_to_rva(0x800, sections)
+
+    def test_native_targets_report_only_unique_rvas(self):
+        signature = b"ABCDEF"
+        ambiguous_signature = b"AMBIGU"
+        section_data = b"\0" * 0x20 + signature + b"\0" * 0x10 + ambiguous_signature + b"\0" * 0x10 + ambiguous_signature
+        data = make_pe_fixture(section_data)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "fifa14.exe"
+            path.write_bytes(data)
+            report = scan_native_targets(
+                path,
+                (
+                    {"name": "unique", "signature": signature},
+                    {"name": "missing", "signature": b"MISSING"},
+                    {"name": "ambiguous", "signature": ambiguous_signature},
+                    {"name": "header", "signature": b"PE\0\0"},
+                    {"name": "offset", "signature": b"ABCDEF", "sigOffset": 2},
+                ),
+            )
+
+        self.assertEqual(report["size"], len(data))
+        self.assertEqual(report["sha256"], hashlib.sha256(data).hexdigest().upper())
+        targets = {target["name"]: target for target in report["targets"]}
+        self.assertEqual(targets["unique"]["status"], "unique")
+        self.assertEqual(targets["unique"]["fileOffset"], 0x420)
+        self.assertEqual(targets["unique"]["rva"], 0x1020)
+        self.assertEqual(targets["missing"], {"name": "missing", "matches": [], "status": "missing"})
+        self.assertEqual(targets["ambiguous"]["status"], "ambiguous")
+        self.assertNotIn("rva", targets["ambiguous"])
+        self.assertNotIn("fileOffset", targets["ambiguous"])
+        self.assertEqual(targets["header"]["status"], "missing")
+        self.assertNotIn("rva", targets["header"])
+        self.assertEqual(targets["offset"]["fileOffset"], 0x41E)
+        self.assertEqual(targets["offset"]["rva"], 0x101E)
+
+    def test_milestone_target_catalog_reuses_reviewed_groups(self):
+        self.assertEqual(len(FIFA14_TARGETS), 3 + 4)
+        self.assertEqual(len(CARDS_TARGETS), 56)
+        self.assertEqual(FIFA14_TARGETS[0]["name"], "CA_FUNCTION")
+        self.assertEqual(CARDS_TARGETS[0]["name"], "PlugInitialize_")
 
 
 if __name__ == "__main__":
