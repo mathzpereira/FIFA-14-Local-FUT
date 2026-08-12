@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 import zlib
@@ -25,6 +27,10 @@ from fifa14_native_signatures import (
     read_pe_sections,
     scan_native_targets,
     scan_signature,
+)
+from fifa14_signature_catalog import (
+    CARDS_TARGETS as CATALOG_CARDS_TARGETS,
+    FIFA14_TARGETS as CATALOG_FIFA14_TARGETS,
 )
 
 
@@ -342,6 +348,31 @@ class BuildLayoutTests(unittest.TestCase):
         self.assertEqual(FIFA14_TARGETS[0]["name"], "CA_FUNCTION")
         self.assertEqual(CARDS_TARGETS[0]["name"], "PlugInitialize_")
 
+    def test_native_catalog_is_populated_and_matches_scanner_targets(self):
+        self.assertEqual(CATALOG_FIFA14_TARGETS, FIFA14_TARGETS)
+        self.assertEqual(CATALOG_CARDS_TARGETS, CARDS_TARGETS)
+        self.assertEqual(len(CATALOG_FIFA14_TARGETS), 7)
+        self.assertEqual(len(CATALOG_CARDS_TARGETS), 56)
+
+    def test_discovery_import_does_not_load_tracer_or_frida(self):
+        tools_path = Path(__file__).resolve().parent
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(tools_path) + os.pathsep + environment.get("PYTHONPATH", "")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; import discover_fifa14_build; "
+                "assert 'frida_pc_fut_nav_route_patch_trace' not in sys.modules; "
+                "assert 'frida' not in sys.modules",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def _populate_discovery_fixture(self, root: Path) -> dict[Path, bytes]:
         contents = {
             "fifa14.exe": make_pe_fixture(),
@@ -431,6 +462,55 @@ class BuildLayoutTests(unittest.TestCase):
 
             self.assertEqual(report["schema"], "fifa14-build-layout-v1")
             self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["schema"], report["schema"])
+            self.assertEqual(before_bytes, {path: path.read_bytes() for path in input_files})
+
+    def test_report_isolates_malformed_native_and_archive_failures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_files = self._populate_discovery_fixture(root)
+            (root / "CardsDLLzf.dll").write_bytes(b"not-a-pe")
+            (root / "cards0.bh").write_bytes(b"not-a-bh")
+            input_files[root / "CardsDLLzf.dll"] = b"not-a-pe"
+            input_files[root / "cards0.bh"] = b"not-a-bh"
+            before_bytes = {path: path.read_bytes() for path in input_files}
+
+            report = build_layout_report(root)
+
+            self.assertEqual(report["native"]["CardsDLLzf.dll"]["status"], "fail")
+            self.assertIn("ValueError", report["native"]["CardsDLLzf.dll"]["error"])
+            self.assertEqual(report["archives"]["cards0"]["status"], "fail")
+            self.assertIn("ValueError", report["archives"]["cards0"]["error"])
+            self.assertEqual(report["route"]["status"], "pass")
+            self.assertEqual(report["archives"]["patch"]["status"], "pass")
+            self.assertEqual(report["native"]["fifa14.exe"]["status"], "pass")
+            self.assertEqual(before_bytes, {path: path.read_bytes() for path in input_files})
+
+    def test_cli_writes_valid_report_and_exits_zero_for_malformed_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as output_temporary:
+            root = Path(temporary)
+            input_files = self._populate_discovery_fixture(root)
+            (root / "CardsDLLzf.dll").write_bytes(b"not-a-pe")
+            (root / "cards0.bh").write_bytes(b"not-a-bh")
+            input_files[root / "CardsDLLzf.dll"] = b"not-a-pe"
+            input_files[root / "cards0.bh"] = b"not-a-bh"
+            before_bytes = {path: path.read_bytes() for path in input_files}
+            output = Path(output_temporary) / "layout.json"
+            script = Path(__file__).with_name("discover_fifa14_build.py")
+
+            completed = subprocess.run(
+                [sys.executable, str(script), "--game-root", str(root), "--output", str(output)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(json.loads(completed.stdout)["profile"], "unknown")
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["schema"], "fifa14-build-layout-v1")
+            self.assertTrue(report["readOnly"])
+            self.assertEqual(report["native"]["CardsDLLzf.dll"]["status"], "fail")
+            self.assertEqual(report["archives"]["cards0"]["status"], "fail")
             self.assertEqual(before_bytes, {path: path.read_bytes() for path in input_files})
 
 

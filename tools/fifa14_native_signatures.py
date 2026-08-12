@@ -1,20 +1,10 @@
 from __future__ import annotations
 
-import ast
 import hashlib
-import re
 import struct
 from pathlib import Path
 
-from frida_pc_fut_nav_route_patch_trace import (
-    CA_FUNCTION_RVA,
-    CA_FUNCTION_SIGNATURE,
-    NAV_TARGETS,
-    SCREEN_EVENT_DISPATCHER_RVA,
-    SCREEN_EVENT_DISPATCHER_SIGNATURE,
-    UPDATE_RVA,
-    UPDATE_SIGNATURE,
-)
+from fifa14_signature_catalog import CARDS_TARGETS, FIFA14_TARGETS
 
 
 def _read_u16(data: bytes, offset: int) -> int:
@@ -139,79 +129,6 @@ def raw_offset_to_rva(offset: int, sections: list[dict[str, int | str]]) -> int:
         raise ValueError("raw offset is contained by multiple PE sections")
     section = candidates[0]
     return int(section["virtualAddress"]) + offset - int(section["rawOffset"])
-
-
-def _cards_targets_from_tracer() -> tuple[dict[str, object], ...]:
-    source_path = Path(__file__).with_name("frida_pc_fut_nav_route_patch_trace.py")
-    source = source_path.read_text(encoding="utf-8")
-    match = re.search(r"const CARDS_TARGETS\s*=\s*(\[.*?\]);", source, re.DOTALL)
-    if match is None:
-        raise ValueError("CARDS_TARGETS is missing from the tracer")
-
-    values: dict[str, int] = {}
-    for name in (
-        "AUTH_RESPONSE_CONSTRUCTOR_RVA",
-        "AUTH_RESPONSE_PARSER_RVA",
-        "AUTH_RESPONSE_SCALAR_CALLBACK_RVA",
-        "AUTH_RESPONSE_KEY_MAPPER_RVA",
-    ):
-        rva_match = re.search(rf"const {name}\s*=\s*(0x[0-9a-fA-F]+);", source)
-        if rva_match is None:
-            raise ValueError(f"{name} is missing from the tracer")
-        values[name] = int(rva_match.group(1), 16)
-    array_text = match.group(1)
-    for name, value in values.items():
-        array_text = re.sub(rf"\b{re.escape(name)}\b", str(value), array_text)
-    array_text = re.sub(
-        r"(?<![A-Za-z0-9_$'\"])([A-Za-z_$][A-Za-z0-9_$]*)\s*:",
-        r"'\1':",
-        array_text,
-    )
-    try:
-        parsed = ast.literal_eval(array_text)
-    except (SyntaxError, ValueError) as error:
-        raise ValueError("CARDS_TARGETS cannot be parsed") from error
-    if not isinstance(parsed, list):
-        raise ValueError("CARDS_TARGETS is not a list")
-
-    targets: list[dict[str, object]] = []
-    for item in parsed:
-        if not isinstance(item, dict):
-            raise ValueError("CARDS_TARGETS contains a non-object")
-        name = item.get("name")
-        rva = item.get("rva")
-        sig_offset = item.get("sigOffset", 0)
-        signature = item.get("signature")
-        if not isinstance(name, str) or not isinstance(rva, int) or not isinstance(sig_offset, int):
-            raise ValueError("CARDS_TARGETS contains invalid target metadata")
-        if not isinstance(signature, list) or any(not isinstance(value, int) for value in signature):
-            raise ValueError("CARDS_TARGETS contains an invalid signature")
-        if sig_offset < 0 or any(value < 0 or value > 0xFF for value in signature):
-            raise ValueError("CARDS_TARGETS contains an invalid signature byte")
-        targets.append(
-            {
-                "name": name,
-                "rva": rva,
-                "sigOffset": sig_offset,
-                "signature": bytes(signature),
-            }
-        )
-    return tuple(targets)
-
-
-CARDS_TARGETS = _cards_targets_from_tracer()
-FIFA14_TARGETS = (
-    {"name": "CA_FUNCTION", "rva": CA_FUNCTION_RVA, "signature": CA_FUNCTION_SIGNATURE},
-    {"name": "UPDATE", "rva": UPDATE_RVA, "signature": UPDATE_SIGNATURE},
-    {
-        "name": "SCREEN_EVENT_DISPATCHER",
-        "rva": SCREEN_EVENT_DISPATCHER_RVA,
-        "signature": SCREEN_EVENT_DISPATCHER_SIGNATURE,
-    },
-) + tuple(
-    {"name": name, "rva": rva, "signature": signature}
-    for name, rva, signature in NAV_TARGETS
-)
 
 
 def _target_result(data: bytes, sections: list[dict[str, int | str]], target: dict[str, object]) -> dict[str, object]:
