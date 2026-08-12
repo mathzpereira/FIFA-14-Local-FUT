@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import struct
 import tempfile
 import unittest
 import zlib
 from pathlib import Path
+
+from discover_fifa14_build import build_layout_report, write_layout_report
 
 from fifa14_build_layout import (
     decode_chunkzip,
@@ -337,6 +341,97 @@ class BuildLayoutTests(unittest.TestCase):
         self.assertEqual(len(CARDS_TARGETS), 56)
         self.assertEqual(FIFA14_TARGETS[0]["name"], "CA_FUNCTION")
         self.assertEqual(CARDS_TARGETS[0]["name"], "PlugInitialize_")
+
+    def _populate_discovery_fixture(self, root: Path) -> dict[Path, bytes]:
+        contents = {
+            "fifa14.exe": make_pe_fixture(),
+            "CardsDLLzf.dll": make_pe_fixture(),
+            "powdllzf.dll": b"powdll-placeholder",
+        }
+        data1_big, data1_bh = make_chunkzip_archive(
+            record_index=4,
+            path_hash=0x1111222233334444,
+            payload=make_big_fixture(b"BIG4", [("route", b"Apt Data:route")]),
+        )
+        cards0_big, cards0_bh = make_chunkzip_archive(
+            record_index=2,
+            path_hash=0x2222333344445555,
+            payload=make_big_fixture(b"BIGF", [("cards", b"Apt Data:cards")]),
+        )
+        patch_big, patch_bh = make_chunkzip_archive(
+            record_index=3,
+            path_hash=0x3333444455556666,
+            payload=make_big_fixture(b"BIG4", [("patch", b"Apt Data:patch")]),
+        )
+        contents.update(
+            {
+                "data1.big": data1_big,
+                "data1.bh": data1_bh,
+                "cards0.big": cards0_big,
+                "cards0.bh": cards0_bh,
+                "patch.big": patch_big,
+                "patch.bh": patch_bh,
+            }
+        )
+        for name, data in contents.items():
+            path = root / name
+            path.write_bytes(data)
+        return {root / name: data for name, data in contents.items()}
+
+    def test_combined_report_contains_read_only_hash_archive_and_native_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_files = self._populate_discovery_fixture(root)
+            before_bytes = {path: path.read_bytes() for path in input_files}
+
+            report = build_layout_report(root)
+
+            self.assertEqual(report["schema"], "fifa14-build-layout-v1")
+            self.assertEqual(report["gameRoot"], str(root.resolve()))
+            self.assertTrue(report["readOnly"])
+            self.assertEqual(report["profile"], "unknown")
+            self.assertEqual(
+                report["hashTuple"],
+                [hashlib.sha256(input_files[root / name]).hexdigest().upper() for name in (
+                    "fifa14.exe",
+                    "CardsDLLzf.dll",
+                    "powdllzf.dll",
+                )],
+            )
+
+            archives = report["archives"]
+            self.assertEqual(set(archives), {"cards0", "patch"})
+            self.assertEqual(archives["cards0"]["status"], "pass")
+            self.assertEqual(archives["patch"]["status"], "pass")
+            self.assertEqual(report["route"]["status"], "pass")
+            self.assertEqual(report["route"]["result"]["matches"][0]["record"]["index"], 4)
+
+            native = report["native"]
+            self.assertEqual(set(native), {"fifa14.exe", "CardsDLLzf.dll"})
+            self.assertEqual(native["fifa14.exe"]["status"], "pass")
+            self.assertEqual(native["CardsDLLzf.dll"]["status"], "pass")
+            self.assertEqual(native["fifa14.exe"]["sections"][0]["name"], ".text")
+            self.assertTrue(all(target["status"] == "missing" for target in native["fifa14.exe"]["targets"]))
+            self.assertEqual(before_bytes, {path: path.read_bytes() for path in input_files})
+
+    def test_write_layout_report_is_atomic_and_hard_link_safe(self):
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as output_temporary:
+            root = Path(temporary)
+            input_files = self._populate_discovery_fixture(root)
+            output = Path(output_temporary) / "nested" / "layout.json"
+            output.parent.mkdir()
+            linked_input = root / "fifa14.exe"
+            try:
+                os.link(linked_input, output)
+            except OSError as error:
+                self.skipTest(f"hard links unavailable: {error}")
+            before_bytes = {path: path.read_bytes() for path in input_files}
+
+            report = write_layout_report(root, output)
+
+            self.assertEqual(report["schema"], "fifa14-build-layout-v1")
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["schema"], report["schema"])
+            self.assertEqual(before_bytes, {path: path.read_bytes() for path in input_files})
 
 
 if __name__ == "__main__":
