@@ -1,0 +1,199 @@
+from __future__ import annotations
+
+import hashlib
+import struct
+import tempfile
+import unittest
+import zlib
+from pathlib import Path
+
+from fifa14_build_layout import (
+    decode_chunkzip,
+    discover_archive_records,
+    discover_big_entries,
+    discover_route_record,
+    read_bh_records,
+)
+
+
+def align(value: int, boundary: int = 16) -> int:
+    return (value + boundary - 1) & ~(boundary - 1)
+
+
+def make_big_fixture(magic: bytes, entries: list[tuple[str, bytes]]) -> bytes:
+    table = bytearray()
+    payloads = bytearray()
+    header_size = 16
+    for name, payload in entries:
+        header_size += 8 + len(name.encode("utf-8")) + 1
+    offset = header_size
+    for name, payload in entries:
+        table.extend(struct.pack(">II", offset, len(payload)))
+        table.extend(name.encode("utf-8"))
+        table.append(0)
+        payloads.extend(payload)
+        offset += len(payload)
+    return magic + struct.pack(">III", offset, len(entries), header_size) + bytes(table) + bytes(payloads)
+
+
+def make_chunkzip(payload: bytes) -> bytes:
+    compressor = zlib.compressobj(level=9, wbits=-zlib.MAX_WBITS)
+    stored = compressor.compress(payload) + compressor.flush()
+    descriptor_end = 40 + 8 + len(stored)
+    chunk_end = align(descriptor_end + 8) - 8
+    return (
+        b"chunkzip"
+        + struct.pack(">IIIIIIII", 2, len(payload), 262144, 1, 16, 0, 0, 0)
+        + struct.pack(">II", len(stored), 1)
+        + stored
+        + b"\0" * (chunk_end - descriptor_end)
+    )
+
+
+def make_chunkzip_archive(record_index: int, path_hash: int, payload: bytes) -> tuple[bytes, bytes]:
+    stored = make_chunkzip(payload)
+    record_offset = 32
+    big = b"\0" * record_offset + stored + b"\0" * 16
+    records = record_index + 1
+    bh = bytearray(b"ViV4" + b"\0" * 12 + b"\0" * (records * 20))
+    struct.pack_into(">I", bh, 8, records)
+    struct.pack_into(">IIIII", bh, 16 + record_index * 20, record_offset, len(stored), 0, path_hash >> 32, path_hash & 0xFFFFFFFF)
+    return big, bytes(bh)
+
+
+class BuildLayoutTests(unittest.TestCase):
+    def test_bigf_and_big4_entry_tables_are_discovered(self):
+        for magic in (b"BIGF", b"BIG4"):
+            decoded = make_big_fixture(magic, [("0", b"Apt Data:1:5:4"), ("1", b"constants")])
+            entries = discover_big_entries(decoded)
+            self.assertEqual([entry["name"] for entry in entries], ["0", "1"])
+            self.assertEqual([entry["index"] for entry in entries], [0, 1])
+            self.assertEqual(entries[0]["size"], len(b"Apt Data:1:5:4"))
+
+    def test_big_entry_table_rejects_truncated_and_ambiguous_data(self):
+        fixture = make_big_fixture(b"BIGF", [("0", b"payload")])
+        with self.assertRaises(ValueError):
+            discover_big_entries(fixture[:-1])
+
+        ambiguous = bytearray(fixture)
+        struct.pack_into(">I", ambiguous, 12, len(fixture) + 1)
+        ambiguous.insert(len(fixture), 0)
+        with self.assertRaises(ValueError):
+            discover_big_entries(bytes(ambiguous))
+
+    def test_bh_records_preserve_offsets_sizes_reserved_and_path_hash(self):
+        path_hash = 0x6471883D373E70C3
+        bh = bytearray(b"ViV4" + b"\0" * 12 + b"\0" * 20)
+        struct.pack_into(">I", bh, 8, 1)
+        struct.pack_into(">IIIII", bh, 16, 32, 123, 7, path_hash >> 32, path_hash & 0xFFFFFFFF)
+
+        self.assertEqual(
+            read_bh_records(bytes(bh)),
+            [{"index": 0, "offset": 32, "size": 123, "reserved": 7, "pathHash": path_hash}],
+        )
+
+    def test_bh_rejects_truncated_header_and_record_table(self):
+        with self.assertRaises(ValueError):
+            read_bh_records(b"ViV4" + b"\0" * 11)
+
+        bh = bytearray(b"ViV4" + b"\0" * 12)
+        struct.pack_into(">I", bh, 8, 1)
+        with self.assertRaises(ValueError):
+            read_bh_records(bytes(bh))
+
+    def test_chunkzip_decodes_valid_payload_without_mutating_input(self):
+        payload = make_chunkzip(b"decoded data")
+        original = bytes(payload)
+        self.assertEqual(decode_chunkzip(payload), b"decoded data")
+        self.assertEqual(payload, original)
+
+    def test_chunkzip_rejects_malformed_headers_chunks_and_output_limit(self):
+        valid = make_chunkzip(b"decoded data")
+        for malformed in (valid[:39], b"notzip" + valid[6:]):
+            with self.assertRaises(ValueError):
+                decode_chunkzip(malformed)
+
+        unsupported_version = bytearray(valid)
+        struct.pack_into(">I", unsupported_version, 8, 1)
+        with self.assertRaises(ValueError):
+            decode_chunkzip(bytes(unsupported_version))
+
+        unsupported_compression = bytearray(valid)
+        struct.pack_into(">I", unsupported_compression, 44, 2)
+        with self.assertRaises(ValueError):
+            decode_chunkzip(bytes(unsupported_compression))
+
+        stored_size = struct.unpack_from(">I", valid, 40)[0]
+        truncated_chunk = valid[: 48 + stored_size - 1]
+        with self.assertRaises(ValueError):
+            decode_chunkzip(truncated_chunk)
+
+        oversized = bytearray(valid)
+        struct.pack_into(">I", oversized, 12, 8 * 1024 * 1024 + 1)
+        with self.assertRaises(ValueError):
+            decode_chunkzip(bytes(oversized))
+
+    def test_route_search_does_not_require_original_offset(self):
+        path_hash = 0x6471883D373E70C3
+        big, bh = make_chunkzip_archive(
+            record_index=4,
+            path_hash=path_hash,
+            payload=make_big_fixture(b"BIGF", [("0", b"Apt Data:1:5:4")]),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            big_path = root / "data1.big"
+            bh_path = root / "data1.bh"
+            big_path.write_bytes(big)
+            bh_path.write_bytes(bh)
+            before = (big_path.read_bytes(), bh_path.read_bytes())
+
+            report = discover_archive_records(big_path, bh_path, (b"Apt Data",))
+
+            self.assertEqual(report["matches"][0]["record"]["index"], 4)
+            self.assertEqual(report["matches"][0]["record"]["pathHash"], "6471883D373E70C3")
+            self.assertEqual(report["matches"][0]["entries"][0]["name"], "0")
+            self.assertEqual(report["recordCount"], 5)
+            self.assertEqual(report["bigSha256"], hashlib.sha256(big).hexdigest())
+            self.assertEqual((big_path.read_bytes(), bh_path.read_bytes()), before)
+
+    def test_archive_reports_truncated_records_without_writing(self):
+        big = b"x" * 20
+        bh = bytearray(b"ViV4" + b"\0" * 12 + b"\0" * 20)
+        struct.pack_into(">I", bh, 8, 1)
+        struct.pack_into(">IIIII", bh, 16, 19, 4, 0, 0, 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            big_path = root / "data1.big"
+            bh_path = root / "data1.bh"
+            big_path.write_bytes(big)
+            bh_path.write_bytes(bh)
+
+            report = discover_archive_records(big_path, bh_path, (b"Apt Data",))
+
+            self.assertEqual(report["matches"], [])
+            self.assertEqual(report["errors"][0]["record"], 0)
+            self.assertEqual(report["errors"][0]["stage"], "read")
+
+    def test_route_report_keeps_known_record_observation_explicit(self):
+        big, bh = make_chunkzip_archive(
+            record_index=4,
+            path_hash=0x6471883D373E70C3,
+            payload=make_big_fixture(b"BIG4", [("0", b"Apt Data:1:5:4")]),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "data1.big").write_bytes(big)
+            (root / "data1.bh").write_bytes(bh)
+
+            report = discover_route_record(root)
+
+            self.assertEqual(report["record16469"]["index"], 16469)
+            self.assertEqual(report["record16469"]["expectedSize"], 1875)
+            self.assertEqual(report["record16469"]["expectedPathHash"], "6471883D373E70C3")
+            self.assertIsNone(report["record16469"]["record"])
+            self.assertEqual(report["matches"][0]["record"]["index"], 4)
+
+
+if __name__ == "__main__":
+    unittest.main()
