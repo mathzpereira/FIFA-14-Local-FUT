@@ -67,6 +67,8 @@ def decode_chunkzip(payload: bytes) -> bytes:
         raise ValueError("unsupported chunkzip v2 header")
     if output_size > MAX_DECODED_BYTES:
         raise ValueError(f"decoded chunkzip exceeds {MAX_DECODED_BYTES} bytes")
+    if not 1 <= count <= 4096:
+        raise ValueError(f"unsupported chunk count {count}")
     if count and chunk_size == 0:
         raise ValueError("chunkzip chunk size is zero")
     if chunk_size > MAX_DECODED_BYTES:
@@ -135,13 +137,14 @@ def discover_big_entries(decoded: bytes) -> list[dict[str, int | str]]:
             name = decoded[position:terminator].decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError("BIG entry name is not UTF-8") from exc
-        if not name or name in names:
+        normalized_name = name.replace("\\", "/")
+        if not normalized_name or normalized_name in names:
             raise ValueError("ambiguous BIG entry name table")
-        names.add(name)
+        names.add(normalized_name)
         position = terminator + 1
         if offset < header_size or size > declared_size - offset:
             raise ValueError(f"BIG entry outside package: {name}")
-        entries.append({"index": index, "name": name.replace("\\", "/"), "offset": offset, "size": size})
+        entries.append({"index": index, "name": normalized_name, "offset": offset, "size": size})
 
     if position != header_size:
         raise ValueError("ambiguous BIG entry table")
@@ -199,13 +202,13 @@ def discover_archive_records(
                 report["record16469"] = record
             size = raw_record["size"]
             offset = raw_record["offset"]
+            if offset > big_size or size > big_size - offset:
+                errors.append({"record": raw_record["index"], "stage": "read", "error": "record exceeds BIG file"})
+                continue
             if size == 0:
                 continue
             if size > MAX_RECORD_BYTES:
                 errors.append({"record": raw_record["index"], "stage": "read", "error": "record exceeds scan limit"})
-                continue
-            if offset > big_size or size > big_size - offset:
-                errors.append({"record": raw_record["index"], "stage": "read", "error": "record exceeds BIG file"})
                 continue
             handle.seek(offset)
             stored = handle.read(size)
@@ -224,8 +227,9 @@ def discover_archive_records(
                 errors.append({"record": raw_record["index"], "stage": "decode", "error": "record exceeds decode limit"})
                 continue
 
+            is_big = decoded[:4] in BIG_MAGICS
             big_entries: list[dict[str, int | str]] = []
-            if decoded[:4] in BIG_MAGICS:
+            if is_big:
                 try:
                     big_entries = discover_big_entries(decoded)
                 except ValueError as exc:
@@ -239,8 +243,10 @@ def discover_archive_records(
                 entry_payload = decoded[start:end]
                 if any(marker in entry_payload for marker in markers):
                     matching_entries.append(entry)
-            direct_match = any(marker in decoded for marker in markers)
-            if not matching_entries and not direct_match:
+            if is_big:
+                if not matching_entries:
+                    continue
+            elif not any(marker in decoded for marker in markers):
                 continue
             matches.append(
                 {

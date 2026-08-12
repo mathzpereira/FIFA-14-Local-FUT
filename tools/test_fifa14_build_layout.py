@@ -81,6 +81,9 @@ class BuildLayoutTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             discover_big_entries(bytes(ambiguous))
 
+        with self.assertRaises(ValueError):
+            discover_big_entries(make_big_fixture(b"BIGF", [("a\\b", b"one"), ("a/b", b"two")]))
+
     def test_bh_records_preserve_offsets_sizes_reserved_and_path_hash(self):
         path_hash = 0x6471883D373E70C3
         bh = bytearray(b"ViV4" + b"\0" * 12 + b"\0" * 20)
@@ -133,8 +136,18 @@ class BuildLayoutTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             decode_chunkzip(bytes(oversized))
 
+        empty = bytearray(valid[:40])
+        struct.pack_into(">I", empty, 20, 0)
+        with self.assertRaisesRegex(ValueError, "chunk count"):
+            decode_chunkzip(bytes(empty))
+
+        too_many = bytearray(valid)
+        struct.pack_into(">I", too_many, 20, 4097)
+        with self.assertRaisesRegex(ValueError, "chunk count"):
+            decode_chunkzip(bytes(too_many))
+
     def test_route_search_does_not_require_original_offset(self):
-        path_hash = 0x6471883D373E70C3
+        path_hash = 0x1111222233334444
         big, bh = make_chunkzip_archive(
             record_index=4,
             path_hash=path_hash,
@@ -151,7 +164,7 @@ class BuildLayoutTests(unittest.TestCase):
             report = discover_archive_records(big_path, bh_path, (b"Apt Data",))
 
             self.assertEqual(report["matches"][0]["record"]["index"], 4)
-            self.assertEqual(report["matches"][0]["record"]["pathHash"], "6471883D373E70C3")
+            self.assertEqual(report["matches"][0]["record"]["pathHash"], "1111222233334444")
             self.assertEqual(report["matches"][0]["entries"][0]["name"], "0")
             self.assertEqual(report["recordCount"], 5)
             self.assertEqual(report["bigSha256"], hashlib.sha256(big).hexdigest())
@@ -174,6 +187,40 @@ class BuildLayoutTests(unittest.TestCase):
             self.assertEqual(report["matches"], [])
             self.assertEqual(report["errors"][0]["record"], 0)
             self.assertEqual(report["errors"][0]["stage"], "read")
+
+    def test_archive_reports_zero_length_out_of_range_records(self):
+        bh = bytearray(b"ViV4" + b"\0" * 12 + b"\0" * 20)
+        struct.pack_into(">I", bh, 8, 1)
+        struct.pack_into(">IIIII", bh, 16, 21, 0, 0, 0, 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            big_path = root / "data1.big"
+            bh_path = root / "data1.bh"
+            big_path.write_bytes(b"x" * 20)
+            bh_path.write_bytes(bh)
+
+            report = discover_archive_records(big_path, bh_path, (b"Apt Data",))
+
+            self.assertEqual(report["matches"], [])
+            self.assertEqual(report["errors"][0]["record"], 0)
+            self.assertEqual(report["errors"][0]["stage"], "read")
+
+    def test_archive_ignores_markers_only_in_big_filenames(self):
+        big, bh = make_chunkzip_archive(
+            record_index=0,
+            path_hash=1,
+            payload=make_big_fixture(b"BIGF", [("Apt Data filename", b"constants")]),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            big_path = root / "data1.big"
+            bh_path = root / "data1.bh"
+            big_path.write_bytes(big)
+            bh_path.write_bytes(bh)
+
+            report = discover_archive_records(big_path, bh_path, (b"Apt Data",))
+
+            self.assertEqual(report["matches"], [])
 
     def test_route_report_keeps_known_record_observation_explicit(self):
         big, bh = make_chunkzip_archive(
